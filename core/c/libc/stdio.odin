@@ -6,12 +6,12 @@ when ODIN_OS == .Windows {
 	when ODIN_CRT_MD {
 		foreign import libc {
 			"system:ucrt.lib",
-			"system:legacy_stdio_definitions.lib"
+			"system:legacy_stdio_definitions.lib",
 		}
 	} else {
 		foreign import libc {
 			"system:libucrt.lib",
-			"system:legacy_stdio_definitions.lib"
+			"system:legacy_stdio_definitions.lib",
 		}
 	}
 } else when ODIN_OS == .Darwin {

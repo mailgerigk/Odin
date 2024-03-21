@@ -9,12 +9,12 @@ when ODIN_OS == .Windows {
 	when ODIN_CRT_MD {
 		foreign import libc {
 			"system:ucrt.lib",
-			"system:msvcprt.lib"
+			"system:msvcprt.lib",
 		}
 	} else {
 		foreign import libc {
 			"system:libucrt.lib",
-			"system:msvcprt.lib"
+			"system:msvcprt.lib",
 		}
 	}
 
