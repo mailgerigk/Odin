@@ -3,7 +3,7 @@ package libc
 import "core:io"
 
 when ODIN_OS == .Windows {
-	when ODIN_CRT_MD {
+	when ODIN_DYNAMIC_CRT {
 		foreign import libc {
 			"system:ucrt.lib",
 			"system:legacy_stdio_definitions.lib",

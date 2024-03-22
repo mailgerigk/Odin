@@ -5,7 +5,7 @@ package libc
 import "base:intrinsics"
 
 when ODIN_OS == .Windows {
-	when ODIN_CRT_MD {
+	when ODIN_DYNAMIC_CRT {
 		foreign import libc "system:ucrt.lib"
 	} else {
 		foreign import libc "system:libucrt.lib"
