@@ -6,7 +6,7 @@ thrd_start_t :: proc "c" (rawptr) -> int
 tss_dtor_t   :: proc "c" (rawptr)
 
 when ODIN_OS == .Windows {
-	when ODIN_DYNAMIC_CRT {
+	when #config(WINDOWS_DYNAMIC_CRT, false) {
 		foreign import libc {
 			"system:ucrt.lib",
 			"system:msvcprt.lib",

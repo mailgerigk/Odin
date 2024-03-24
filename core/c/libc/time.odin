@@ -3,7 +3,7 @@ package libc
 // 7.27 Date and time
 
 when ODIN_OS == .Windows {
-	when ODIN_DYNAMIC_CRT {
+	when #config(WINDOWS_DYNAMIC_CRT, false) {
 		foreign import libc "system:ucrt.lib"
 	} else {
 		foreign import libc "system:libucrt.lib"

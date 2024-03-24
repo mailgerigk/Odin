@@ -5,7 +5,7 @@ import "base:runtime"
 // 7.24 String handling
 
 when ODIN_OS == .Windows {
-	when ODIN_DYNAMIC_CRT {
+	when #config(WINDOWS_DYNAMIC_CRT, false) {
 		foreign import libc "system:ucrt.lib"
 	} else {
 		foreign import libc "system:libucrt.lib"

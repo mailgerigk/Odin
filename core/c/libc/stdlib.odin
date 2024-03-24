@@ -2,11 +2,8 @@ package libc
 
 // 7.22 General utilities
 
-// Link ucrt.lib (/MD) instead of libucrt.lib (/MT) on windows
-ODIN_DYNAMIC_CRT :: #config(ODIN_DYNAMIC_CRT, false)
-
 when ODIN_OS == .Windows {
-	when ODIN_DYNAMIC_CRT {
+	when #config(WINDOWS_DYNAMIC_CRT, false) {
 		foreign import libc "system:ucrt.lib"
 	} else {
 		foreign import libc "system:libucrt.lib"
