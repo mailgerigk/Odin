@@ -224,7 +224,7 @@ gb_internal Scope *create_scope(CheckerInfo *info, Scope *parent) {
 	if (parent != nullptr && parent != builtin_pkg->scope) {
 		Scope *prev_head_child = parent->head_child.exchange(s, std::memory_order_acq_rel);
 		if (prev_head_child) {
-			prev_head_child->next.store(s, std::memory_order_release);
+			s->next.store(prev_head_child, std::memory_order_release);
 		}
 	}
 
@@ -703,6 +703,15 @@ gb_internal void check_scope_usage(Checker *c, Scope *scope, u64 vet_flags) {
 			array_add(&vetted_entities, ve_unused);
 		} else if (is_shadowed) {
 			array_add(&vetted_entities, ve_shadowed);
+		} else if (e->kind == Entity_Variable && (e->flags & (EntityFlag_Param|EntityFlag_Using)) == 0) {
+			i64 sz = type_size_of(e->type);
+			// TODO(bill): When is a good size warn?
+			// Is 128 KiB good enough?
+			if (sz >= 1ll<<17) {
+				gbString type_str = type_to_string(e->type);
+				warning(e->token, "Declaration of '%.*s' may cause a stack overflow due to its type '%s' having a size of %lld bytes", LIT(e->token.string), type_str, cast(long long)sz);
+				gb_string_free(type_str);
+			}
 		}
 	}
 	rw_mutex_shared_unlock(&scope->mutex);
@@ -732,17 +741,6 @@ gb_internal void check_scope_usage(Checker *c, Scope *scope, u64 vet_flags) {
 				break;
 			default:
 				break;
-			}
-		}
-
-		if (e->kind == Entity_Variable && (e->flags & (EntityFlag_Param|EntityFlag_Using)) == 0) {
-			i64 sz = type_size_of(e->type);
-			// TODO(bill): When is a good size warn?
-			// Is 128 KiB good enough?
-			if (sz >= 1ll<<17) {
-				gbString type_str = type_to_string(e->type);
-				warning(e->token, "Declaration of '%.*s' may cause a stack overflow due to its type '%s' having a size of %lld bytes", LIT(name), type_str, cast(long long)sz);
-				gb_string_free(type_str);
 			}
 		}
 	}
@@ -1097,6 +1095,15 @@ gb_internal void init_universal(void) {
 		scope_insert(intrinsics_pkg->scope, t_atomic_memory_order->Named.type_name);
 	}
 
+	{
+		int minimum_os_version = 0;
+		if (build_context.minimum_os_version_string != "") {
+			int major, minor, revision = 0;
+			sscanf(cast(const char *)(build_context.minimum_os_version_string.text), "%d.%d.%d", &major, &minor, &revision);
+			minimum_os_version = (major*10000)+(minor*100)+revision;
+		}
+		add_global_constant("ODIN_MINIMUM_OS_VERSION", t_untyped_integer, exact_value_i64(minimum_os_version));
+	}
 
 	add_global_bool_constant("ODIN_DEBUG",                      bc->ODIN_DEBUG);
 	add_global_bool_constant("ODIN_DISABLE_ASSERT",             bc->ODIN_DISABLE_ASSERT);
@@ -1115,7 +1122,16 @@ gb_internal void init_universal(void) {
 
 	add_global_constant("ODIN_COMPILE_TIMESTAMP", t_untyped_integer, exact_value_i64(odin_compile_timestamp()));
 
-	add_global_bool_constant("__ODIN_LLVM_F16_SUPPORTED", lb_use_new_pass_system() && !is_arch_wasm());
+	{
+		bool f16_supported = lb_use_new_pass_system();
+		if (is_arch_wasm()) {
+			f16_supported = false;
+		} else if (build_context.metrics.os == TargetOs_darwin && build_context.metrics.arch == TargetArch_amd64) {
+			// NOTE(laytan): See #3222 for my ramblings on this.
+			f16_supported = false;
+		}
+		add_global_bool_constant("__ODIN_LLVM_F16_SUPPORTED", f16_supported);
+	}
 
 	{
 		GlobalEnumValue values[3] = {
@@ -1218,9 +1234,9 @@ gb_internal void init_universal(void) {
 
 	// intrinsics types for objective-c stuff
 	{
-		t_objc_object   = add_global_type_name(intrinsics_pkg->scope, str_lit("objc_object"),   alloc_type_struct());
-		t_objc_selector = add_global_type_name(intrinsics_pkg->scope, str_lit("objc_selector"), alloc_type_struct());
-		t_objc_class    = add_global_type_name(intrinsics_pkg->scope, str_lit("objc_class"),    alloc_type_struct());
+		t_objc_object   = add_global_type_name(intrinsics_pkg->scope, str_lit("objc_object"),   alloc_type_struct_complete());
+		t_objc_selector = add_global_type_name(intrinsics_pkg->scope, str_lit("objc_selector"), alloc_type_struct_complete());
+		t_objc_class    = add_global_type_name(intrinsics_pkg->scope, str_lit("objc_class"),    alloc_type_struct_complete());
 
 		t_objc_id       = alloc_type_pointer(t_objc_object);
 		t_objc_SEL      = alloc_type_pointer(t_objc_selector);
@@ -1362,6 +1378,7 @@ gb_internal void init_checker(Checker *c) {
 	array_init(&c->nested_proc_lits, heap_allocator(), 0, 1<<20);
 
 	mpsc_init(&c->global_untyped_queue, a); // , 1<<20);
+	mpsc_init(&c->soa_types_to_complete, a); // , 1<<20);
 
 	c->builtin_ctx = make_checker_context(c);
 }
@@ -1374,6 +1391,7 @@ gb_internal void destroy_checker(Checker *c) {
 	array_free(&c->nested_proc_lits);
 	array_free(&c->procs_to_check);
 	mpsc_destroy(&c->global_untyped_queue);
+	mpsc_destroy(&c->soa_types_to_complete);
 }
 
 
@@ -1673,6 +1691,26 @@ gb_internal bool add_entity_with_name(CheckerContext *c, Scope *scope, Ast *iden
 	}
 	return true;
 }
+
+gb_internal bool add_entity_with_name(CheckerInfo *info, Scope *scope, Ast *identifier, Entity *entity, String name) {
+	if (scope == nullptr) {
+		return false;
+	}
+
+
+	if (!is_blank_ident(name)) {
+		Entity *ie = scope_insert(scope, entity);
+		if (ie != nullptr) {
+			return redeclaration_error(name, entity, ie);
+		}
+	}
+	if (identifier != nullptr) {
+		GB_ASSERT(entity->file != nullptr);
+		add_entity_definition(info, identifier, entity);
+	}
+	return true;
+}
+
 gb_internal bool add_entity(CheckerContext *c, Scope *scope, Ast *identifier, Entity *entity) {
 	return add_entity_with_name(c, scope, identifier, entity, entity->token.string);
 }
@@ -1997,6 +2035,8 @@ gb_internal void add_type_info_type_internal(CheckerContext *c, Type *t) {
 		break;
 
 	case Type_Struct:
+		if (bt->Struct.fields_wait_signal.futex.load() == 0)
+			return;
 		if (bt->Struct.scope != nullptr) {
 			for (auto const &entry : bt->Struct.scope->elements) {
 				Entity *e = entry.value;
@@ -2017,7 +2057,9 @@ gb_internal void add_type_info_type_internal(CheckerContext *c, Type *t) {
 		add_type_info_type_internal(c, bt->Struct.polymorphic_params);
 		for_array(i, bt->Struct.fields) {
 			Entity *f = bt->Struct.fields[i];
-			add_type_info_type_internal(c, f->type);
+			if (f && f->type) {
+				add_type_info_type_internal(c, f->type);
+			}
 		}
 		add_comparison_procedures_for_fields(c, bt);
 		break;
@@ -3180,6 +3222,7 @@ gb_internal DECL_ATTRIBUTE_PROC(proc_decl_attribute) {
 		    linkage == "link_once") {
 			ac->linkage = linkage;
 		} else {
+			ERROR_BLOCK();
 			error(elem, "Invalid linkage '%.*s'. Valid kinds:", LIT(linkage));
 			error_line("\tinternal\n");
 			error_line("\tstrong\n");
@@ -3428,6 +3471,7 @@ gb_internal DECL_ATTRIBUTE_PROC(proc_decl_attribute) {
 			} else if (mode == "speed") {
 				ac->optimization_mode = ProcedureOptimizationMode_Speed;
 			} else {
+				ERROR_BLOCK();
 				error(elem, "Invalid optimization_mode for '%.*s'. Valid modes:", LIT(name));
 				error_line("\tnone\n");
 				error_line("\tminimal\n");
@@ -3558,6 +3602,7 @@ gb_internal DECL_ATTRIBUTE_PROC(var_decl_attribute) {
 			    model == "localexec") {
 				ac->thread_local_model = model;
 			} else {
+				ERROR_BLOCK();
 				error(elem, "Invalid thread local model '%.*s'. Valid models:", LIT(model));
 				error_line("\tdefault\n");
 				error_line("\tlocaldynamic\n");
@@ -3608,6 +3653,7 @@ gb_internal DECL_ATTRIBUTE_PROC(var_decl_attribute) {
 		    linkage == "link_once") {
 			ac->linkage = linkage;
 		} else {
+			ERROR_BLOCK();
 			error(elem, "Invalid linkage '%.*s'. Valid kinds:", LIT(linkage));
 			error_line("\tinternal\n");
 			error_line("\tstrong\n");
@@ -3661,6 +3707,15 @@ gb_internal DECL_ATTRIBUTE_PROC(const_decl_attribute) {
 		return true;
 	} else if (name == "private") {
 		// NOTE(bill): Handled elsewhere `check_collect_value_decl`
+		return true;
+	} else if (name == "static" ||
+	           name == "thread_local" ||
+	           name == "require" ||
+	           name == "linkage" ||
+	           name == "link_name" ||
+	           name == "link_prefix" ||
+	           false) {
+		error(elem, "@(%.*s) is not supported for compile time constant value declarations", LIT(name));
 		return true;
 	}
 	return false;
@@ -3762,6 +3817,7 @@ gb_internal void check_decl_attributes(CheckerContext *c, Array<Ast *> const &at
 
 			if (!proc(c, elem, name, value, ac)) {
 				if (!build_context.ignore_unknown_attributes) {
+					ERROR_BLOCK();
 					error(elem, "Unknown attribute element name '%.*s'", LIT(name));
 					error_line("\tDid you forget to use build flag '-ignore-unknown-attributes'?\n");
 				}
@@ -3831,6 +3887,8 @@ gb_internal bool check_arity_match(CheckerContext *c, AstValueDecl *vd, bool is_
 			gb_string_free(str);
 			return false;
 		} else if (is_global) {
+			ERROR_BLOCK();
+
 			Ast *n = vd->values[rhs-1];
 			error(n, "Expected %td expressions on the right hand side, got %td", lhs, rhs);
 			error_line("Note: Global declarations do not allow for multi-valued expressions");
@@ -4050,6 +4108,7 @@ gb_internal void check_collect_value_decl(CheckerContext *c, Ast *decl) {
 			Entity *e = alloc_entity_variable(c->scope, name->Ident.token, nullptr);
 			e->identifier = name;
 			e->file = c->file;
+			e->Variable.is_global = true;
 
 			if (entity_visibility_kind != EntityVisiblity_Public) {
 				e->flags |= EntityFlag_NotExported;
@@ -4414,6 +4473,10 @@ gb_internal void check_all_global_entities(Checker *c) {
 		DeclInfo *d = e->decl_info;
 		check_single_global_entity(c, e, d);
 		if (e->type != nullptr && is_type_typed(e->type)) {
+			for (Type *t = nullptr; mpsc_dequeue(&c->soa_types_to_complete, &t); /**/) {
+				complete_soa_type(c, t, false);
+			}
+
 			(void)type_size_of(e->type);
 			(void)type_align_of(e->type);
 		}
@@ -5448,7 +5511,10 @@ gb_internal void check_procedure_later_from_entity(Checker *c, Entity *e, char c
 		return;
 	}
 	Type *type = base_type(e->type);
-	GB_ASSERT(type->kind == Type_Proc);
+	if (type == t_invalid) {
+		return;
+	}
+	GB_ASSERT_MSG(type->kind == Type_Proc, "%s", type_to_string(e->type));
 
 	if (is_type_polymorphic(type) && !type->Proc.is_poly_specialized) {
 		return;
@@ -6051,11 +6117,14 @@ gb_internal void check_unique_package_names(Checker *c) {
 			continue;
 		}
 
+
+		begin_error_block();
 		error(curr, "Duplicate declaration of 'package %.*s'", LIT(name));
 		error_line("\tA package name must be unique\n"
 		           "\tThere is no relation between a package name and the directory that contains it, so they can be completely different\n"
 		           "\tA package name is required for link name prefixing to have a consistent ABI\n");
-		error(prev, "found at previous location");
+		error_line("%s found at previous location\n", token_pos_to_string(ast_token(prev).pos));
+		end_error_block();
 	}
 }
 
@@ -6076,6 +6145,9 @@ gb_internal void check_add_definitions_from_queues(Checker *c) {
 }
 
 gb_internal void check_merge_queues_into_arrays(Checker *c) {
+	for (Type *t = nullptr; mpsc_dequeue(&c->soa_types_to_complete, &t); /**/) {
+		complete_soa_type(c, t, false);
+	}
 	check_add_entities_from_queues(c);
 	check_add_definitions_from_queues(c);
 }
@@ -6285,6 +6357,8 @@ gb_internal void check_parsed_files(Checker *c) {
 
 	TIME_SECTION("check bodies have all been checked");
 	check_unchecked_bodies(c);
+
+	TIME_SECTION("check #soa types");
 
 	check_merge_queues_into_arrays(c);
 	thread_pool_wait();

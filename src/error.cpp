@@ -28,7 +28,7 @@ gb_global ErrorCollector global_error_collector;
 
 
 gb_internal void push_error_value(TokenPos const &pos, ErrorValueKind kind = ErrorValue_Error) {
-	GB_ASSERT(global_error_collector.curr_error_value_set.load() == false);
+	GB_ASSERT_MSG(global_error_collector.curr_error_value_set.load() == false, "Possible race condition in error handling system, please report this with an issue");
 	ErrorValue ev = {kind, pos};
 	ev.msgs.allocator = heap_allocator();
 
@@ -53,7 +53,7 @@ gb_internal void try_pop_error_value(void) {
 }
 
 gb_internal ErrorValue *get_error_value(void) {
-	GB_ASSERT(global_error_collector.curr_error_value_set.load() == true);
+	GB_ASSERT_MSG(global_error_collector.curr_error_value_set.load() == true, "Possible race condition in error handling system, please report this with an issue");
 	return &global_error_collector.curr_error_value;
 }
 
@@ -62,7 +62,9 @@ gb_internal ErrorValue *get_error_value(void) {
 gb_internal bool any_errors(void) {
 	return global_error_collector.count.load() != 0;
 }
-
+gb_internal bool any_warnings(void) {
+	return global_error_collector.warning_count.load() != 0;
+}
 
 
 gb_internal void init_global_error_collector(void) {
@@ -600,7 +602,9 @@ gb_internal void syntax_error_with_verbose(TokenPos pos, TokenPos end, char cons
 
 
 gb_internal void compiler_error(char const *fmt, ...) {
-	print_all_errors();
+	if (any_errors() || any_warnings()) {
+		print_all_errors();
+	}
 
 	va_list va;
 
@@ -614,7 +618,9 @@ gb_internal void compiler_error(char const *fmt, ...) {
 
 
 gb_internal void exit_with_errors(void) {
-	print_all_errors();
+	if (any_errors() || any_warnings()) {
+		print_all_errors();
+	}
 	gb_exit(1);
 }
 
@@ -646,7 +652,7 @@ gb_internal void print_all_errors(void) {
 		}
 	};
 
-	GB_ASSERT(any_errors());
+	GB_ASSERT(any_errors() || any_warnings());
 	gbFile *f = gb_file_get_standard(gbFileStandard_Error);
 
 	array_sort(global_error_collector.error_values, error_value_cmp);

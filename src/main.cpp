@@ -1066,6 +1066,7 @@ gb_internal bool parse_build_flags(Array<String> args) {
 						case BuildFlag_MinimumOSVersion: {
 							GB_ASSERT(value.kind == ExactValue_String);
 							build_context.minimum_os_version_string = value.value_string;
+							build_context.minimum_os_version_string_given = true;
 							break;
 						}
 						case BuildFlag_RelocMode: {
@@ -1925,8 +1926,8 @@ gb_internal void print_show_help(String const arg0, String const &command) {
 	if (run_or_build) {
 		print_usage_line(1, "-minimum-os-version:<string>");
 		print_usage_line(2, "Sets the minimum OS version targeted by the application.");
-		print_usage_line(2, "Example: -minimum-os-version:12.0.0");
-		print_usage_line(2, "(Only used when target is Darwin.)");
+		print_usage_line(2, "Default: -minimum-os-version:11.0.0");
+		print_usage_line(2, "Only used when target is Darwin, if given, linking mismatched versions will emit a warning.");
 		print_usage_line(0, "");
 
 		print_usage_line(1, "-extra-linker-flags:<string>");
@@ -2693,6 +2694,9 @@ int main(int arg_count, char const **arg_ptr) {
 		print_all_errors();
 		return 1;
 	}
+	if (any_warnings()) {
+		print_all_errors();
+	}
 
 	MAIN_TIME_SECTION("type check");
 
@@ -2705,6 +2709,10 @@ int main(int arg_count, char const **arg_ptr) {
 		print_all_errors();
 		return 1;
 	}
+	if (any_warnings()) {
+		print_all_errors();
+	}
+
 
 	if (build_context.command_kind == Command_strip_semicolon) {
 		return strip_semicolons(parser);

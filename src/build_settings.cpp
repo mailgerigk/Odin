@@ -436,7 +436,9 @@ struct BuildContext {
 	BlockingMutex target_features_mutex;
 	StringSet target_features_set;
 	String target_features_string;
+
 	String minimum_os_version_string;
+	bool   minimum_os_version_string_given;
 };
 
 gb_global BuildContext build_context = {0};
@@ -510,7 +512,7 @@ gb_global TargetMetrics target_darwin_amd64 = {
 	TargetOs_darwin,
 	TargetArch_amd64,
 	8, 8, 8, 16,
-	str_lit("x86_64-apple-darwin"),
+	str_lit("x86_64-apple-macosx"), // NOTE: Changes during initialization based on build flags.
 	str_lit("e-m:o-i64:64-f80:128-n8:16:32:64-S128"),
 };
 
@@ -518,7 +520,7 @@ gb_global TargetMetrics target_darwin_arm64 = {
 	TargetOs_darwin,
 	TargetArch_arm64,
 	8, 8, 8, 16,
-	str_lit("arm64-apple-macosx11.0.0"),
+	str_lit("arm64-apple-macosx"), // NOTE: Changes during initialization based on build flags.
 	str_lit("e-m:o-i64:64-i128:128-n32:64-S128"),
 };
 
@@ -1187,12 +1189,24 @@ gb_internal String path_to_fullpath(gbAllocator a, String s, bool *ok_) {
 	return result;
 }
 #elif defined(GB_SYSTEM_OSX) || defined(GB_SYSTEM_UNIX)
+
+struct PathToFullpathResult {
+	String result;
+	bool   ok;
+};
+
 gb_internal String path_to_fullpath(gbAllocator a, String s, bool *ok_) {
+	static gb_thread_local StringMap<PathToFullpathResult> cache;
+
+	PathToFullpathResult *cached = string_map_get(&cache, s);
+	if (cached != nullptr) {
+		if (ok_) *ok_ = cached->ok;
+		return copy_string(a, cached->result);
+	}
+
 	char *p;
-	mutex_lock(&fullpath_mutex);
 	p = realpath(cast(char *)s.text, 0);
 	defer (free(p));
-	mutex_unlock(&fullpath_mutex);
 	if(p == nullptr) {
 		if (ok_) *ok_ = false;
 
@@ -1205,10 +1219,24 @@ gb_internal String path_to_fullpath(gbAllocator a, String s, bool *ok_) {
 		//
 		// I have opted for 2 because it is much simpler + we already return `ok = false` + further
 		// checks and processes will use the path and cause errors (which we want).
-		return copy_string(a, s);
+		String result = copy_string(a, s);
+
+		PathToFullpathResult cached_result = {};
+		cached_result.result = copy_string(permanent_allocator(), result);
+		cached_result.ok     = false;
+		string_map_set(&cache, copy_string(permanent_allocator(), s), cached_result);
+
+		return result;
 	}
 	if (ok_) *ok_ = true;
-	return copy_string(a, make_string_c(p));
+	String result = copy_string(a, make_string_c(p));
+
+	PathToFullpathResult cached_result = {};
+	cached_result.result = copy_string(permanent_allocator(), result);
+	cached_result.ok     = true;
+	string_map_set(&cache, copy_string(permanent_allocator(), s), cached_result);
+
+	return result;
 }
 #else
 #error Implement system
@@ -1418,19 +1446,25 @@ gb_internal void init_build_context(TargetMetrics *cross_target, Subtarget subta
 	}
 
 	bc->metrics = *metrics;
-	switch (subtarget) {
-	case Subtarget_Default:
-		break;
-	case Subtarget_iOS:
-		GB_ASSERT(metrics->os == TargetOs_darwin);
-		if (metrics->arch == TargetArch_arm64) {
-			bc->metrics.target_triplet = str_lit("arm64-apple-ios");
-		} else if (metrics->arch == TargetArch_amd64) {
-			bc->metrics.target_triplet = str_lit("x86_64-apple-ios");
-		} else {
-			GB_PANIC("Unknown architecture for darwin");
+	if (metrics->os == TargetOs_darwin) {
+		if (!bc->minimum_os_version_string_given) {
+			bc->minimum_os_version_string = str_lit("11.0.0");
 		}
-		break;
+
+		switch (subtarget) {
+		case Subtarget_Default:
+			bc->metrics.target_triplet = concatenate_strings(permanent_allocator(), bc->metrics.target_triplet, bc->minimum_os_version_string);
+			break;
+		case Subtarget_iOS:
+			if (metrics->arch == TargetArch_arm64) {
+				bc->metrics.target_triplet = str_lit("arm64-apple-ios");
+			} else if (metrics->arch == TargetArch_amd64) {
+				bc->metrics.target_triplet = str_lit("x86_64-apple-ios");
+			} else {
+				GB_PANIC("Unknown architecture for darwin");
+			}
+			break;
+		}
 	}
 
 	bc->ODIN_OS           = target_os_names[metrics->os];

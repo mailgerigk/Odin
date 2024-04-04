@@ -502,18 +502,24 @@ gb_internal i32 linker_stage(LinkerData *gen) {
 					platform_lib_str = gb_string_appendc(platform_lib_str, "-L/opt/local/lib ");
 				}
 
-				// This sets a requirement of Mountain Lion and up, but the compiler doesn't work without this limit.
-				if (build_context.minimum_os_version_string.len) {
+				// Only specify this flag if the user has given a minimum version to target.
+				// This will cause warnings to show up for mismatched libraries.
+				if (build_context.minimum_os_version_string_given) {
 					link_settings = gb_string_append_fmt(link_settings, "-mmacosx-version-min=%.*s ", LIT(build_context.minimum_os_version_string));
 				}
-				// This points the linker to where the entry point is
-				link_settings = gb_string_appendc(link_settings, "-e _main ");
+
+				if (build_context.build_mode != BuildMode_DynamicLibrary) {
+					// This points the linker to where the entry point is
+					link_settings = gb_string_appendc(link_settings, "-e _main ");
+				}
 			}
 
 			if (!build_context.no_crt) {
 				platform_lib_str = gb_string_appendc(platform_lib_str, "-lm ");
 				if (build_context.metrics.os == TargetOs_darwin) {
-					platform_lib_str = gb_string_appendc(platform_lib_str, "-lSystem ");
+					// NOTE: adding this causes a warning about duplicate libraries, I think it is
+					// automatically assumed/added by clang when you don't do `-nostdlib`.
+					// platform_lib_str = gb_string_appendc(platform_lib_str, "-lSystem ");
 				} else {
 					platform_lib_str = gb_string_appendc(platform_lib_str, "-lc ");
 				}

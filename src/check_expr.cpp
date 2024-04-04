@@ -79,7 +79,6 @@ gb_internal Type *   check_type_expr                (CheckerContext *c, Ast *exp
 gb_internal Type *   make_optional_ok_type          (Type *value, bool typed=true);
 gb_internal Entity * check_selector                 (CheckerContext *c, Operand *operand, Ast *node, Type *type_hint);
 gb_internal Entity * check_ident                    (CheckerContext *c, Operand *o, Ast *n, Type *named_type, Type *type_hint, bool allow_import_name);
-gb_internal Entity * find_polymorphic_record_entity (CheckerContext *c, Type *original_type, isize param_count, Array<Operand> const &ordered_operands, bool *failure);
 gb_internal void     check_not_tuple                (CheckerContext *c, Operand *operand);
 gb_internal void     convert_to_typed               (CheckerContext *c, Operand *operand, Type *target_type);
 gb_internal gbString expr_to_string                 (Ast *expression);
@@ -120,6 +119,10 @@ gb_internal bool is_diverging_expr(Ast *expr);
 gb_internal isize get_procedure_param_count_excluding_defaults(Type *pt, isize *param_count_);
 
 gb_internal bool is_expr_inferred_fixed_array(Ast *type_expr);
+
+gb_internal Entity *find_polymorphic_record_entity(GenTypesData *found_gen_types, isize param_count, Array<Operand> const &ordered_operands);
+
+gb_internal bool complete_soa_type(Checker *checker, Type *t, bool wait_to_finish);
 
 enum LoadDirectiveResult {
 	LoadDirective_Success  = 0,
@@ -1174,6 +1177,16 @@ gb_internal void check_assignment(CheckerContext *c, Operand *operand, Type *typ
 				      type_str, type_extra,
 				      LIT(context_name));
 				check_assignment_error_suggestion(c, operand, type);
+
+				if (context_name == "procedure argument") {
+					Type *src = base_type(operand->type);
+					Type *dst = base_type(type);
+					if (is_type_slice(src) && are_types_identical(src->Slice.elem, dst)) {
+						gbString a = expr_to_string(operand->expr);
+						error_line("\tSuggestion: Did you mean to pass the slice into the variadic parameter with ..%s?\n\n", a);
+						gb_string_free(a);
+					}
+				}
 			}
 			break;
 		}
@@ -1727,7 +1740,7 @@ gb_internal Entity *check_ident(CheckerContext *c, Operand *o, Ast *n, Type *nam
 		if (check_cycle(c, e, true)) {
 			o->type = t_invalid;
 		}
-		if (o->type != nullptr && type->kind == Type_Named && o->type->Named.type_name->TypeName.is_type_alias) {
+		if (o->type != nullptr && o->type->kind == Type_Named && o->type->Named.type_name->TypeName.is_type_alias) {
 			o->type = base_type(o->type);
 		}
 
@@ -1800,6 +1813,21 @@ gb_internal bool check_unary_op(CheckerContext *c, Operand *o, Token op) {
 		}
 		break;
 
+	case Token_Mul:
+		{
+			ERROR_BLOCK();
+			error(op, "Operator '%.*s' is not a valid unary operator in Odin", LIT(op.string));
+			if (is_type_pointer(o->type)) {
+				str = expr_to_string(o->expr);
+				error_line("\tSuggestion: Did you mean '%s^'?\n", str);
+				o->type = type_deref(o->type);
+			} else if (is_type_multi_pointer(o->type)) {
+				str = expr_to_string(o->expr);
+				error_line("\tSuggestion: The value is a multi-pointer, did you mean '%s[0]'?\n", str);
+				o->type = type_deref(o->type, true);
+			}
+		}
+		break;
 	default:
 		error(op, "Unknown operator '%.*s'", LIT(op.string));
 		return false;
@@ -2391,10 +2419,6 @@ gb_internal bool check_is_not_addressable(CheckerContext *c, Operand *o) {
 }
 
 gb_internal void check_old_for_or_switch_value_usage(Ast *expr) {
-	if (!(build_context.strict_style || (check_vet_flags(expr) & VetFlag_Style))) {
-		return;
-	}
-
 	Entity *e = entity_of_node(expr);
 	if (e != nullptr && (e->flags & EntityFlag_OldForOrSwitchValue) != 0) {
 		GB_ASSERT(e->kind == Entity_Variable);
@@ -2404,7 +2428,7 @@ gb_internal void check_old_for_or_switch_value_usage(Ast *expr) {
 		if ((e->flags & EntityFlag_ForValue) != 0) {
 			Type *parent_type = type_deref(e->Variable.for_loop_parent_type);
 
-			error(expr, "Assuming a for-in defined value is addressable as the iterable is passed by value has been disallowed with '-strict-style'.");
+			error(expr, "Assuming a for-in defined value is addressable as the iterable is passed by value has been disallowed.");
 
 			if (is_type_map(parent_type)) {
 				error_line("\tSuggestion: Prefer doing 'for key, &%.*s in ...'\n", LIT(e->token.string));
@@ -2414,7 +2438,7 @@ gb_internal void check_old_for_or_switch_value_usage(Ast *expr) {
 		} else {
 			GB_ASSERT((e->flags & EntityFlag_SwitchValue) != 0);
 
-			error(expr, "Assuming a switch-in defined value is addressable as the iterable is passed by value has been disallowed with '-strict-style'.");
+			error(expr, "Assuming a switch-in defined value is addressable as the iterable is passed by value has been disallowed.");
 			error_line("\tSuggestion: Prefer doing 'switch &%.*s in ...'\n", LIT(e->token.string));
 		}
 	}
@@ -4105,7 +4129,7 @@ gb_internal void update_untyped_expr_value(CheckerContext *c, Ast *e, ExactValue
 	}
 }
 
-gb_internal void convert_untyped_error(CheckerContext *c, Operand *operand, Type *target_type) {
+gb_internal void convert_untyped_error(CheckerContext *c, Operand *operand, Type *target_type, bool ignore_error_block=false) {
 	gbString expr_str = expr_to_string(operand->expr);
 	gbString type_str = type_to_string(target_type);
 	gbString from_type_str = type_to_string(operand->type);
@@ -4119,7 +4143,9 @@ gb_internal void convert_untyped_error(CheckerContext *c, Operand *operand, Type
 			}
 		}
 	}
-	ERROR_BLOCK();
+	if (!ignore_error_block) {
+		begin_error_block();
+	}
 
 	error(operand->expr, "Cannot convert untyped value '%s' to '%s' from '%s'%s", expr_str, type_str, from_type_str, extra_text);
 	if (operand->value.kind == ExactValue_String) {
@@ -4134,6 +4160,11 @@ gb_internal void convert_untyped_error(CheckerContext *c, Operand *operand, Type
 	gb_string_free(type_str);
 	gb_string_free(expr_str);
 	operand->mode = Addressing_Invalid;
+
+	if (!ignore_error_block) {
+		end_error_block();
+	}
+
 }
 
 gb_internal ExactValue convert_exact_value_for_type(ExactValue v, Type *type) {
@@ -4263,7 +4294,7 @@ gb_internal void convert_to_typed(CheckerContext *c, Operand *operand, Type *tar
 				operand->mode = Addressing_Invalid;
 				ERROR_BLOCK();
 				
-				convert_untyped_error(c, operand, target_type);
+				convert_untyped_error(c, operand, target_type, true);
 				error_line("\tNote: Only a square matrix types can be initialized with a scalar value\n");
 				return;
 			} else {
@@ -4326,7 +4357,7 @@ gb_internal void convert_to_typed(CheckerContext *c, Operand *operand, Type *tar
 
 				GB_ASSERT(first_success_index >= 0);
 				operand->mode = Addressing_Invalid;
-				convert_untyped_error(c, operand, target_type);
+				convert_untyped_error(c, operand, target_type, true);
 
 				error_line("Ambiguous type conversion to '%s', which variant did you mean:\n\t", type_str);
 				i32 j = 0;
@@ -4351,9 +4382,10 @@ gb_internal void convert_to_typed(CheckerContext *c, Operand *operand, Type *tar
 				ERROR_BLOCK();
 
 				operand->mode = Addressing_Invalid;
-				convert_untyped_error(c, operand, target_type);
+				convert_untyped_error(c, operand, target_type, true);
 				if (count > 0) {
 					error_line("'%s' is a union which only excepts the following types:\n", type_str);
+
 					error_line("\t");
 					for (i32 i = 0; i < count; i++) {
 						Type *v = t->Union.variants[i];
@@ -4885,10 +4917,18 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 	Selection sel = {}; // NOTE(bill): Not used if it's an import name
 
 	if (!c->allow_arrow_right_selector_expr && se->token.kind == Token_ArrowRight) {
+		ERROR_BLOCK();
 		error(node, "Illegal use of -> selector shorthand outside of a call");
-		operand->mode = Addressing_Invalid;
-		operand->expr = node;
-		return nullptr;
+		gbString x = expr_to_string(se->expr);
+		gbString y = expr_to_string(se->selector);
+		error_line("\tSuggestion: Did you mean '%s.%s'?\n", x, y);
+		gb_string_free(y);
+		gb_string_free(x);
+
+		// TODO(bill): Should this terminate here or propagate onwards?
+		// operand->mode = Addressing_Invalid;
+		// operand->expr = node;
+		// return nullptr;
 	}
 
 	operand->expr = node;
@@ -4997,6 +5037,9 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 		}
 	}
 
+	if (operand->type && is_type_soa_struct(type_deref(operand->type))) {
+		complete_soa_type(c->checker, type_deref(operand->type), false);
+	}
 
 	if (entity == nullptr && selector->kind == Ast_Ident) {
 		String field_name = selector->Ident.token.string;
@@ -5797,10 +5840,14 @@ gb_internal CallArgumentError check_call_arguments_internal(CheckerContext *c, A
 			Operand *variadic_operand = &ordered_operands[pt->variadic_index];
 
 			if (vari_expand) {
-				GB_ASSERT(variadic_operands.count != 0);
-				*variadic_operand = variadic_operands[0];
-				variadic_operand->type = default_type(variadic_operand->type);
-				actually_variadic = true;
+				if (variadic_operands.count == 0) {
+					error(call, "'..' in the wrong position");
+				} else {
+					GB_ASSERT(variadic_operands.count != 0);
+					*variadic_operand = variadic_operands[0];
+					variadic_operand->type = default_type(variadic_operand->type);
+					actually_variadic = true;
+				}
 			} else {
 				AstFile *f = call->file();
 
@@ -5883,14 +5930,6 @@ gb_internal CallArgumentError check_call_arguments_internal(CheckerContext *c, A
 			} else {
 				if (show_error) {
 					check_assignment(c, o, param_type, str_lit("procedure argument"));
-
-					Type *src = base_type(o->type);
-					Type *dst = base_type(param_type);
-					if (is_type_slice(src) && are_types_identical(src->Slice.elem, dst)) {
-						gbString a = expr_to_string(o->expr);
-						error_line("\tSuggestion: Did you mean to pass the slice into the variadic parameter with ..%s?\n\n", a);
-						gb_string_free(a);
-					}
 				}
 				err = CallArgumentError_WrongTypes;
 			}
@@ -6138,7 +6177,10 @@ gb_internal bool evaluate_where_clauses(CheckerContext *ctx, Ast *call_expr, Sco
 						}
 					}
 
-					if (call_expr) error(call_expr, "at caller location");
+					if (call_expr) {
+						TokenPos pos = ast_token(call_expr).pos;
+						error_line("%s at caller location\n", token_pos_to_string(pos));
+					}
 				}
 				return false;
 			}
@@ -7139,8 +7181,12 @@ gb_internal CallArgumentError check_polymorphic_record_type(CheckerContext *c, O
 	}
 
 	{
-		bool failure = false;
-		Entity *found_entity = find_polymorphic_record_entity(c, original_type, param_count, ordered_operands, &failure);
+		GenTypesData *found_gen_types = ensure_polymorphic_record_entity_has_gen_types(c, original_type);
+
+		mutex_lock(&found_gen_types->mutex);
+		defer (mutex_unlock(&found_gen_types->mutex));
+		Entity *found_entity = find_polymorphic_record_entity(found_gen_types, param_count, ordered_operands);
+
 		if (found_entity) {
 			operand->mode = Addressing_Type;
 			operand->type = found_entity->type;
@@ -8433,6 +8479,7 @@ gb_internal ExprKind check_or_return_expr(CheckerContext *c, Operand *o, Ast *no
 				// NOTE(bill): allow implicit conversion between boolean types
 				// within 'or_return' to improve the experience using third-party code
 			} else if (!check_is_assignable_to(c, &rhs, end_type)) {
+				ERROR_BLOCK();
 				// TODO(bill): better error message
 				gbString a = type_to_string(right_type);
 				gbString b = type_to_string(end_type);
@@ -8840,6 +8887,7 @@ gb_internal ExprKind check_compound_literal(CheckerContext *c, Operand *o, Ast *
 			break;
 		}
 
+		wait_signal_until_available(&t->Struct.fields_wait_signal);
 		isize field_count = t->Struct.fields.count;
 		isize min_field_count = t->Struct.fields.count;
 		for (isize i = min_field_count-1; i >= 0; i--) {
@@ -10004,6 +10052,7 @@ gb_internal ExprKind check_index_expr(CheckerContext *c, Operand *o, Ast *node, 
 	bool ok = check_index_value(c, t, false, ie->index, max_count, &index, index_type_hint);
 	if (is_const) {
 		if (index < 0) {
+			ERROR_BLOCK();
 			gbString str = expr_to_string(o->expr);
 			error(o->expr, "Cannot index a constant '%s'", str);
 			if (!build_context.terse_errors) {
@@ -10020,6 +10069,7 @@ gb_internal ExprKind check_index_expr(CheckerContext *c, Operand *o, Ast *node, 
 			bool finish = false;
 			o->value = get_constant_field_single(c, value, cast(i32)index, &success, &finish);
 			if (!success) {
+				ERROR_BLOCK();
 				gbString str = expr_to_string(o->expr);
 				error(o->expr, "Cannot index a constant '%s' with index %lld", str, cast(long long)index);
 				if (!build_context.terse_errors) {
@@ -10210,6 +10260,7 @@ gb_internal ExprKind check_slice_expr(CheckerContext *c, Operand *o, Ast *node, 
 			}
 		}
 		if (!all_constant) {
+			ERROR_BLOCK();
 			gbString str = expr_to_string(o->expr);
 			error(o->expr, "Cannot slice '%s' with non-constant indices", str);
 			if (!build_context.terse_errors) {
@@ -11232,6 +11283,18 @@ gb_internal gbString write_expr_to_string(gbString str, Ast *node, bool shorthan
 				}
 				if (field->flags&FieldFlag_c_vararg) {
 					str = gb_string_appendc(str, "#c_vararg ");
+				}
+				if (field->flags&FieldFlag_any_int) {
+					str = gb_string_appendc(str, "#any_int ");
+				}
+				if (field->flags&FieldFlag_no_broadcast) {
+					str = gb_string_appendc(str, "#no_broadcast ");
+				}
+				if (field->flags&FieldFlag_const) {
+					str = gb_string_appendc(str, "#const ");
+				}
+				if (field->flags&FieldFlag_subtype) {
+					str = gb_string_appendc(str, "#subtype ");
 				}
 
 				str = write_expr_to_string(str, field->type, shorthand);
