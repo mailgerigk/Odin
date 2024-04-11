@@ -578,7 +578,10 @@ gb_internal void lb_begin_procedure_body(lbProcedure *p) {
 				defer (param_index += 1);
 
 				if (arg_type->kind == lbArg_Ignore) {
-					continue;
+					// Even though it is an ignored argument, it might still be referenced in the
+					// body.
+					lbValue dummy = lb_add_local_generated(p, e->type, false).addr;
+					lb_add_entity(p->module, e, dummy);
 				} else if (arg_type->kind == lbArg_Direct) {
 					if (e->token.string.len != 0 && !is_blank_ident(e->token.string)) {
 						LLVMTypeRef param_type = lb_type(p->module, e->type);
@@ -1051,6 +1054,7 @@ gb_internal lbValue lb_emit_call(lbProcedure *p, lbValue value, Array<lbValue> c
 			Type *original_type = e->type;
 			lbArgType *arg = &ft->args[param_index];
 			if (arg->kind == lbArg_Ignore) {
+				param_index += 1;
 				continue;
 			}
 
@@ -3055,9 +3059,6 @@ gb_internal lbValue lb_build_builtin_proc(lbProcedure *p, Ast *expr, TypeAndValu
 	case BuiltinProc_wasm_memory_atomic_wait32:
 		{
 			char const *name = "llvm.wasm.memory.atomic.wait32";
-			LLVMTypeRef types[1] = {
-				lb_type(p->module, t_u32),
-			};
 
 			Type *t_u32_ptr = alloc_type_pointer(t_u32);
 
@@ -3068,26 +3069,24 @@ gb_internal lbValue lb_build_builtin_proc(lbProcedure *p, Ast *expr, TypeAndValu
 
 			lbValue res = {};
 			res.type = tv.type;
-			res.value = lb_call_intrinsic(p, name, args, gb_count_of(args), types, gb_count_of(types));
+			res.value = lb_call_intrinsic(p, name, args, gb_count_of(args), nullptr, 0);
 			return res;
 		}
 
 	case BuiltinProc_wasm_memory_atomic_notify32:
 		{
 			char const *name = "llvm.wasm.memory.atomic.notify";
-			LLVMTypeRef types[1] = {
-				lb_type(p->module, t_u32),
-			};
 
 			Type *t_u32_ptr = alloc_type_pointer(t_u32);
 
 			LLVMValueRef args[2] = {
-					lb_emit_conv(p, lb_build_expr(p, ce->args[0]), t_u32_ptr).value,
-					lb_emit_conv(p, lb_build_expr(p, ce->args[1]), t_u32).value };
+				lb_emit_conv(p, lb_build_expr(p, ce->args[0]), t_u32_ptr).value,
+				lb_emit_conv(p, lb_build_expr(p, ce->args[1]), t_u32).value
+			};
 
 			lbValue res = {};
 			res.type = tv.type;
-			res.value = lb_call_intrinsic(p, name, args, gb_count_of(args), types, gb_count_of(types));
+			res.value = lb_call_intrinsic(p, name, args, gb_count_of(args), nullptr, 0);
 			return res;
 		}
 
