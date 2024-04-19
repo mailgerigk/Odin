@@ -2138,14 +2138,45 @@ gb_internal lbValue lb_emit_conv(lbProcedure *p, lbValue value, Type *t) {
 
 	if (is_type_array_like(dst)) {
 		Type *elem = base_array_type(dst);
-		lbValue e = lb_emit_conv(p, value, elem);
-		// NOTE(bill): Doesn't need to be zero because it will be initialized in the loops
-		lbAddr v = lb_add_local_generated(p, t, false);
 		isize index_count = cast(isize)get_array_type_count(dst);
 
-		for (isize i = 0; i < index_count; i++) {
-			lbValue elem = lb_emit_array_epi(p, v.addr, i);
+		isize inlineable = type_size_of(dst) <= build_context.max_simd_align;
+		lbValue e = lb_emit_conv(p, value, elem);
+		if (inlineable && lb_is_const(e)) {
+			lbAddr v = {};
+			if (e.value) {
+				TEMPORARY_ALLOCATOR_GUARD();
+				LLVMValueRef *values = gb_alloc_array(temporary_allocator(), LLVMValueRef, index_count);
+				for (isize i = 0; i < index_count; i++) {
+					values[i] = e.value;
+				}
+				lbValue array_const_value = {};
+				array_const_value.type = t;
+				array_const_value.value = LLVMConstArray(lb_type(m, elem), values, cast(unsigned)index_count);
+				v = lb_add_global_generated(m, t, array_const_value);
+			} else {
+				v = lb_add_global_generated(m, t);
+			}
+
+			lb_make_global_private_const(v);
+			return lb_addr_load(p, v);
+		}
+
+		// NOTE(bill): Doesn't need to be zero because it will be initialized in the loops
+		lbAddr v = lb_add_local_generated(p, t, false);
+
+		if (!inlineable) {
+			auto loop_data = lb_loop_start(p, index_count, t_int);
+
+			lbValue elem = lb_emit_array_ep(p, v.addr, loop_data.idx);
 			lb_emit_store(p, elem, e);
+
+			lb_loop_end(p, loop_data);
+		} else {
+			for (isize i = 0; i < index_count; i++) {
+				lbValue elem = lb_emit_array_epi(p, v.addr, i);
+				lb_emit_store(p, elem, e);
+			}
 		}
 		return lb_addr_load(p, v);
 	}
@@ -3085,7 +3116,7 @@ gb_internal lbValue lb_build_unary_and(lbProcedure *p, Ast *expr) {
 				Type *dst_type = type;
 
 
-				if ((p->state_flags & StateFlag_no_type_assert) == 0) {
+				if (!build_context.no_type_assert && (p->state_flags & StateFlag_no_type_assert) == 0) {
 					lbValue src_tag = {};
 					lbValue dst_tag = {};
 					if (is_type_union_maybe_pointer(src_type)) {
@@ -3125,7 +3156,7 @@ gb_internal lbValue lb_build_unary_and(lbProcedure *p, Ast *expr) {
 					v = lb_emit_load(p, v);
 				}
 				lbValue data_ptr = lb_emit_struct_ev(p, v, 0);
-				if ((p->state_flags & StateFlag_no_type_assert) == 0) {
+				if (!build_context.no_type_assert && (p->state_flags & StateFlag_no_type_assert) == 0) {
 					GB_ASSERT(!build_context.no_rtti);
 
 					lbValue any_id = lb_emit_struct_ev(p, v, 1);
