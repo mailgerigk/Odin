@@ -569,3 +569,6 @@ RedrawWindowFlags :: enum UINT {
 	RDW_FRAME           = 0x0400,
 	RDW_NOFRAME         = 0x0800,
 }
+
+LWA_COLORKEY :: 0x00000001
+LWA_ALPHA :: 0x00000002
