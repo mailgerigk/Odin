@@ -2514,7 +2514,7 @@ gb_internal lbValue lb_emit_comp(lbProcedure *p, TokenKind op_kind, lbValue left
 			case Token_Lt:    runtime_procedure = "cstring_lt"; break;
 			case Token_Gt:    runtime_procedure = "cstring_gt"; break;
 			case Token_LtEq:  runtime_procedure = "cstring_le"; break;
-			case Token_GtEq:  runtime_procedure = "cstring_gt"; break;
+			case Token_GtEq:  runtime_procedure = "cstring_ge"; break;
 			}
 			GB_ASSERT(runtime_procedure != nullptr);
 
@@ -2537,7 +2537,7 @@ gb_internal lbValue lb_emit_comp(lbProcedure *p, TokenKind op_kind, lbValue left
 		case Token_Lt:    runtime_procedure = "string_lt"; break;
 		case Token_Gt:    runtime_procedure = "string_gt"; break;
 		case Token_LtEq:  runtime_procedure = "string_le"; break;
-		case Token_GtEq:  runtime_procedure = "string_gt"; break;
+		case Token_GtEq:  runtime_procedure = "string_ge"; break;
 		}
 		GB_ASSERT(runtime_procedure != nullptr);
 
@@ -3851,27 +3851,39 @@ gb_internal lbAddr lb_build_addr_index_expr(lbProcedure *p, Ast *expr) {
 
 	if (ie->expr->tav.mode == Addressing_SoaVariable) {
 		// SOA Structures for slices/dynamic arrays
-		GB_ASSERT(is_type_pointer(type_of_expr(ie->expr)));
+		GB_ASSERT_MSG(is_type_multi_pointer(type_of_expr(ie->expr)), "%s", type_to_string(type_of_expr(ie->expr)));
 
 		lbValue field = lb_build_expr(p, ie->expr);
 		lbValue index = lb_build_expr(p, ie->index);
 
-
 		if (!build_context.no_bounds_check) {
-			// TODO HACK(bill): Clean up this hack to get the length for bounds checking
-			// GB_ASSERT(LLVMIsALoadInst(field.value));
+			Ast *se_expr = unparen_expr(ie->expr);
+			if (se_expr->kind == Ast_SelectorExpr) {
+				ast_node(se, SelectorExpr, se_expr);
+				lbValue len = {};
 
-			// lbValue a = {};
-			// a.value = LLVMGetOperand(field.value, 0);
-			// a.type = alloc_type_pointer(field.type);
+				Type *type = base_type(type_deref(type_of_expr(se->expr)));
+				GB_ASSERT_MSG(is_type_soa_struct(type), "%s", type_to_string(type));
+				if (type->Struct.soa_kind == StructSoa_Fixed) {
+					len = lb_const_int(p->module, t_int, type->Struct.soa_count);
+				} else {
+					lbAddr *found = map_get(&p->selector_addr, se_expr);
+					if (found) {
+						lbAddr addr = *found;
+						lbValue parent = lb_addr_get_ptr(p, addr);
+						if (is_type_pointer(type_deref(parent.type))) {
+							parent = lb_emit_load(p, parent);
+						}
+						len = lb_soa_struct_len(p, parent);
+					}
+				}
 
-			// irInstr *b = &a->Instr;
-			// GB_ASSERT(b->kind == irInstr_StructElementPtr);
-			// lbValue base_struct = b->StructElementPtr.address;
-
-			// GB_ASSERT(is_type_soa_struct(type_deref(ir_type(base_struct))));
-			// lbValue len = ir_soa_struct_len(p, base_struct);
-			// lb_emit_bounds_check(p, ast_token(ie->index), index, len);
+				if (len.value) {
+					lb_emit_bounds_check(p, ast_token(ie->index), index, len);
+				}
+			} else {
+				// TODO(bill): how do you even do bounds checking here?
+			}
 		}
 		lbValue val = lb_emit_ptr_offset(p, field, index);
 		return lb_addr(val);
@@ -4141,7 +4153,7 @@ gb_internal lbAddr lb_build_addr_slice_expr(lbProcedure *p, Ast *expr) {
 		if (se->high == nullptr) {
 			lbValue offset = base;
 			LLVMValueRef indices[1] = {low.value};
-			offset.value = LLVMBuildGEP2(p->builder, lb_type(p->module, offset.type->MultiPointer.elem), offset.value, indices, 1, "");
+			offset.value = LLVMBuildGEP2(p->builder, lb_type(p->module, base_type(offset.type)->MultiPointer.elem), offset.value, indices, 1, "");
 			lb_addr_store(p, res, offset);
 		} else {
 			low = lb_emit_conv(p, low, t_int);
@@ -4150,7 +4162,7 @@ gb_internal lbAddr lb_build_addr_slice_expr(lbProcedure *p, Ast *expr) {
 			lb_emit_multi_pointer_slice_bounds_check(p, se->open, low, high);
 
 			LLVMValueRef indices[1] = {low.value};
-			LLVMValueRef ptr = LLVMBuildGEP2(p->builder, lb_type(p->module, base.type->MultiPointer.elem), base.value, indices, 1, "");
+			LLVMValueRef ptr = LLVMBuildGEP2(p->builder, lb_type(p->module, base_type(base.type)->MultiPointer.elem), base.value, indices, 1, "");
 			LLVMValueRef len = LLVMBuildSub(p->builder, high.value, low.value, "");
 
 			LLVMValueRef gep0 = lb_emit_struct_ep(p, res.addr, 0).value;
@@ -4218,6 +4230,7 @@ gb_internal lbAddr lb_build_addr_slice_expr(lbProcedure *p, Ast *expr) {
 					lbValue field_dst = lb_emit_struct_ep(p, dst.addr, i);
 					lbValue field_src = lb_emit_struct_ep(p, lb_addr_get_ptr(p, addr), i);
 					field_src = lb_emit_array_ep(p, field_src, low);
+					field_src = lb_emit_conv(p, field_src, type_deref(field_dst.type));
 					lb_emit_store(p, field_dst, field_src);
 				}
 
@@ -4233,6 +4246,7 @@ gb_internal lbAddr lb_build_addr_slice_expr(lbProcedure *p, Ast *expr) {
 						lbValue field_dst = lb_emit_struct_ep(p, dst.addr, i);
 						lbValue field_src = lb_emit_struct_ev(p, base, i);
 						field_src = lb_emit_ptr_offset(p, field_src, low);
+						field_src = lb_emit_conv(p, field_src, type_deref(field_dst.type));
 						lb_emit_store(p, field_dst, field_src);
 					}
 
@@ -4247,6 +4261,7 @@ gb_internal lbAddr lb_build_addr_slice_expr(lbProcedure *p, Ast *expr) {
 					lbValue field_dst = lb_emit_struct_ep(p, dst.addr, i);
 					lbValue field_src = lb_emit_struct_ev(p, base, i);
 					field_src = lb_emit_ptr_offset(p, field_src, low);
+					field_src = lb_emit_conv(p, field_src, type_deref(field_dst.type));
 					lb_emit_store(p, field_dst, field_src);
 				}
 
@@ -4296,7 +4311,19 @@ gb_internal lbAddr lb_build_addr_compound_lit(lbProcedure *p, Ast *expr) {
 	switch (bt->kind) {
 	default: GB_PANIC("Unknown CompoundLit type: %s", type_to_string(type)); break;
 
-	case Type_BitField:
+	case Type_BitField: {
+		TEMPORARY_ALLOCATOR_GUARD();
+
+		// Type *backing_type = core_type(bt->BitField.backing_type);
+
+		struct FieldData {
+			Type *field_type;
+			u64 bit_offset;
+			u64 bit_size;
+		};
+		auto values = array_make<lbValue>(temporary_allocator(), 0, cl->elems.count);
+		auto fields = array_make<FieldData>(temporary_allocator(), 0, cl->elems.count);
+
 		for (Ast *elem : cl->elems) {
 			ast_node(fv, FieldValue, elem);
 			String name = fv->field->Ident.token.string;
@@ -4307,26 +4334,176 @@ gb_internal lbAddr lb_build_addr_compound_lit(lbProcedure *p, Ast *expr) {
 			GB_ASSERT(sel.entity != nullptr);
 
 			i64 index = sel.index[0];
-			i64 bit_offset = 0;
-			i64 bit_size = -1;
-			for_array(i, bt->BitField.fields) {
-				Entity *f = bt->BitField.fields[i];
-				if (f == sel.entity) {
-					bit_offset = bt->BitField.bit_offsets[i];
-					bit_size   = bt->BitField.bit_sizes[i];
-					break;
-				}
-			}
+			Entity *f = bt->BitField.fields[index];
+			GB_ASSERT(f == sel.entity);
+			i64 bit_offset = bt->BitField.bit_offsets[index];
+			i64 bit_size   = bt->BitField.bit_sizes[index];
 			GB_ASSERT(bit_size > 0);
 
 			Type *field_type = sel.entity->type;
 			lbValue field_expr = lb_build_expr(p, fv->value);
 			field_expr = lb_emit_conv(p, field_expr, field_type);
-
-			lbAddr field_addr = lb_addr_bit_field(v.addr, field_type, index, bit_offset, bit_size);
-			lb_addr_store(p, field_addr, field_expr);
+			array_add(&values, field_expr);
+			array_add(&fields, FieldData{field_type, cast(u64)bit_offset, cast(u64)bit_size});
 		}
+
+		// NOTE(bill): inline insertion sort should be good enough, right?
+		for (isize i = 1; i < values.count; i++) {
+			for (isize j = i;
+			     j > 0 && fields[i].bit_offset < fields[j].bit_offset;
+			     j--) {
+				auto vtmp = values[j];
+				values[j] = values[j-1];
+				values[j-1] = vtmp;
+
+				auto ftmp = fields[j];
+				fields[j] = fields[j-1];
+				fields[j-1] = ftmp;
+			}
+		}
+
+		bool any_fields_different_endian = false;
+		for (auto const &f : fields) {
+			if (is_type_different_to_arch_endianness(f.field_type)) {
+				// NOTE(bill): Just be slow for this, to be correct
+				any_fields_different_endian = true;
+				break;
+			}
+		}
+
+		if (!any_fields_different_endian &&
+		    fields.count == bt->BitField.fields.count) {
+			// SINGLE INTEGER BACKING ONLY
+
+			Type *backing_type = core_type(bt->BitField.backing_type);
+			GB_ASSERT(is_type_integer(backing_type) ||
+			          (is_type_array(backing_type) && is_type_integer(backing_type->Array.elem)));
+
+			// NOTE(bill): all fields are present
+			// this means no masking is necessary since on write, the bits will be overridden
+
+			lbValue dst_byte_ptr = lb_emit_conv(p, v.addr, t_u8_ptr);
+			u64 total_bit_size = cast(u64)(8*type_size_of(bt));
+
+			if (is_type_integer(backing_type)) {
+				LLVMTypeRef lit = lb_type(p->module, backing_type);
+
+				LLVMValueRef res = LLVMConstInt(lit, 0, false);
+
+				for (isize i = 0; i < fields.count; i++) {
+					auto const &f = fields[i];
+
+					LLVMValueRef mask = LLVMConstInt(lit, 1, false);
+					mask = LLVMConstShl(mask, LLVMConstInt(lit, f.bit_size, false));
+					mask = LLVMConstSub(mask, LLVMConstInt(lit, 1, false));
+
+					LLVMValueRef elem = values[i].value;
+					if (lb_sizeof(lit) < lb_sizeof(LLVMTypeOf(elem))) {
+						elem = LLVMBuildTrunc(p->builder, elem, lit, "");
+					} else {
+						elem = LLVMBuildZExt(p->builder, elem, lit, "");
+					}
+					elem = LLVMBuildAnd(p->builder, elem, mask, "");
+
+					elem = LLVMBuildShl(p->builder, elem, LLVMConstInt(lit, f.bit_offset, false), "");
+
+					res = LLVMBuildOr(p->builder, res, elem, "");
+				}
+
+				LLVMBuildStore(p->builder, res, v.addr.value);
+			} else if (is_type_array(backing_type)) {
+				// ARRAY OF INTEGER BACKING
+
+				i64 array_count = backing_type->Array.count;
+				LLVMTypeRef lit = lb_type(p->module, core_type(backing_type->Array.elem));
+				gb_unused(array_count);
+				gb_unused(lit);
+
+				LLVMValueRef *elems = gb_alloc_array(temporary_allocator(), LLVMValueRef, array_count);
+				for (i64 i = 0; i < array_count; i++) {
+					elems[i] = LLVMConstInt(lit, 0, false);
+				}
+
+				u64 elem_bit_size = cast(u64)(8*type_size_of(backing_type->Array.elem));
+				u64 curr_bit_offset = 0;
+				for (isize i = 0; i < fields.count; i++) {
+					auto const &f = fields[i];
+
+					LLVMValueRef val = values[i].value;
+					LLVMTypeRef vt = lb_type(p->module, values[i].type);
+					for (u64 bits_to_set = f.bit_size;
+					     bits_to_set > 0;
+					     /**/) {
+						i64 elem_idx = curr_bit_offset/elem_bit_size;
+						u64 elem_bit_offset = curr_bit_offset%elem_bit_size;
+
+						u64 mask_width = gb_min(bits_to_set, elem_bit_size-elem_bit_offset);
+						GB_ASSERT(mask_width > 0);
+						bits_to_set -= mask_width;
+
+						LLVMValueRef mask = LLVMConstInt(vt, 1, false);
+						mask = LLVMConstShl(mask, LLVMConstInt(vt, mask_width, false));
+						mask = LLVMConstSub(mask, LLVMConstInt(vt, 1, false));
+
+						LLVMValueRef to_set = LLVMBuildAnd(p->builder, val, mask, "");
+
+						if (elem_bit_offset != 0) {
+							to_set = LLVMBuildShl(p->builder, to_set, LLVMConstInt(vt, elem_bit_offset, false), "");
+						}
+						to_set = LLVMBuildTrunc(p->builder, to_set, lit, "");
+
+						if (LLVMIsNull(elems[elem_idx])) {
+							elems[elem_idx] = to_set; // don't even bother doing `0 | to_set`
+						} else {
+							elems[elem_idx] = LLVMBuildOr(p->builder, elems[elem_idx], to_set, "");
+						}
+
+						if (mask_width != 0) {
+							val = LLVMBuildLShr(p->builder, val, LLVMConstInt(vt, mask_width, false), "");
+						}
+						curr_bit_offset += mask_width;
+					}
+
+					GB_ASSERT(curr_bit_offset == f.bit_offset + f.bit_size);
+				}
+
+				for (i64 i = 0; i < array_count; i++) {
+					LLVMValueRef elem_ptr = LLVMBuildStructGEP2(p->builder, lb_type(p->module, backing_type), v.addr.value, cast(unsigned)i, "");
+					LLVMBuildStore(p->builder, elems[i], elem_ptr);
+				}
+			} else {
+				// SLOW STORAGE
+
+				for_array(i, fields) {
+					auto const &f = fields[i];
+
+					if ((f.bit_offset & 7) == 0) {
+						u64 unpacked_bit_size  = cast(u64)(8*type_size_of(f.field_type));
+						u64 byte_size = (f.bit_size+7)/8;
+
+						if (f.bit_offset + unpacked_bit_size <= total_bit_size) {
+							byte_size = unpacked_bit_size/8;
+						}
+						lbValue dst = lb_emit_ptr_offset(p, dst_byte_ptr, lb_const_int(p->module, t_int, f.bit_offset/8));
+						lbValue src = lb_address_from_load_or_generate_local(p, values[i]);
+						lb_mem_copy_non_overlapping(p, dst, src, lb_const_int(p->module, t_uintptr, byte_size));
+					} else {
+						lbAddr dst = lb_addr_bit_field(v.addr, f.field_type, f.bit_offset, f.bit_size);
+						lb_addr_store(p, dst, values[i]);
+					}
+				}
+			}
+		} else {
+			// individual storing
+			for_array(i, values) {
+				auto const &f = fields[i];
+				lbAddr dst = lb_addr_bit_field(v.addr, f.field_type, f.bit_offset, f.bit_size);
+				lb_addr_store(p, dst, values[i]);
+			}
+		}
+
 		return v;
+	}
 
 	case Type_Struct: {
 		// TODO(bill): "constant" '#raw_union's are not initialized constantly at the moment.
@@ -4771,7 +4948,7 @@ gb_internal lbAddr lb_build_addr_internal(lbProcedure *p, Ast *expr) {
 				u8 bit_size = bf_type->BitField.bit_sizes[index];
 				i64 bit_offset = bf_type->BitField.bit_offsets[index];
 
-				return lb_addr_bit_field(ptr, f->type, index, bit_offset, bit_size);
+				return lb_addr_bit_field(ptr, f->type, bit_offset, bit_size);
 			}
 
 			{
@@ -4816,6 +4993,9 @@ gb_internal lbAddr lb_build_addr_internal(lbProcedure *p, Ast *expr) {
 					if (sub_sel.index.count > 0) {
 						item = lb_emit_deep_field_gep(p, item, sub_sel);
 					}
+					// make sure it's ^T and not [^]T
+					item.type = alloc_type_multi_pointer_to_pointer(item.type);
+
 					return lb_addr(item);
 				} else if (addr.kind == lbAddr_Swizzle) {
 					GB_ASSERT(sel.index.count > 0);
@@ -4825,6 +5005,11 @@ gb_internal lbAddr lb_build_addr_internal(lbProcedure *p, Ast *expr) {
 					GB_ASSERT(sel.index.count > 0);
 					// NOTE(bill): just patch the index in place
 					sel.index[0] = addr.swizzle.indices[sel.index[0]];
+				}
+
+				Type *atype = type_deref(lb_addr_type(addr));
+				if (is_type_soa_struct(atype)) {
+					map_set(&p->selector_addr, expr, addr);
 				}
 
 				lbValue a = lb_addr_get_ptr(p, addr);
@@ -5031,6 +5216,54 @@ gb_internal lbAddr lb_build_addr_internal(lbProcedure *p, Ast *expr) {
 	case_ast_node(oe, OrReturnExpr, expr);
 		lbValue ptr = lb_address_from_load_or_generate_local(p, lb_build_expr(p, expr));
 		return lb_addr(ptr);
+	case_end;
+
+
+	case_ast_node(be, OrBranchExpr, expr);
+		lbBlock *block = nullptr;
+
+		if (be->label != nullptr) {
+			lbBranchBlocks bb = lb_lookup_branch_blocks(p, be->label);
+			switch (be->token.kind) {
+			case Token_or_break:    block = bb.break_;    break;
+			case Token_or_continue: block = bb.continue_; break;
+			}
+		} else {
+			for (lbTargetList *t = p->target_list; t != nullptr && block == nullptr; t = t->prev) {
+				if (t->is_block) {
+					continue;
+				}
+
+				switch (be->token.kind) {
+				case Token_or_break:    block = t->break_;    break;
+				case Token_or_continue: block = t->continue_; break;
+				}
+			}
+		}
+
+		GB_ASSERT(block != nullptr);
+		TypeAndValue tv = expr->tav;
+
+		lbValue lhs = {};
+		lbValue rhs = {};
+		lb_emit_try_lhs_rhs(p, be->expr, tv, &lhs, &rhs);
+		Type *type = default_type(tv.type);
+		if (lhs.value) {
+			lhs = lb_emit_conv(p, lhs, type);
+		} else if (type != nullptr && type != t_invalid) {
+			lhs = lb_const_nil(p->module, type);
+		}
+
+		lbBlock *then  = lb_create_block(p, "or_branch.then");
+		lbBlock *else_ = lb_create_block(p, "or_branch.else");
+
+		lb_emit_if(p, lb_emit_try_has_value(p, rhs), then, else_);
+		lb_start_block(p, else_);
+		lb_emit_defer_stmts(p, lbDeferExit_Branch, block);
+		lb_emit_jump(p, block);
+		lb_start_block(p, then);
+
+		return lb_addr(lb_address_from_load_or_generate_local(p, lhs));
 	case_end;
 	}
 

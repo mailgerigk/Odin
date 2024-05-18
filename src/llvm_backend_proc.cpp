@@ -177,17 +177,24 @@ gb_internal lbProcedure *lb_create_procedure(lbModule *m, Entity *entity, bool i
 		break;
 	}
 
-	if (!entity->Procedure.target_feature_disabled &&
-	    entity->Procedure.target_feature.len != 0) {
-	    	auto features = split_by_comma(entity->Procedure.target_feature);
-		for_array(i, features) {
-			String feature = features[i];
-			LLVMAttributeRef ref = LLVMCreateStringAttribute(
-				m->ctx,
-				cast(char const *)feature.text, cast(unsigned)feature.len,
-				"", 0);
-			LLVMAddAttributeAtIndex(p->value, LLVMAttributeIndex_FunctionIndex, ref);
+	if (pt->Proc.enable_target_feature.len != 0) {
+		gbString feature_str = gb_string_make(temporary_allocator(), "");
+
+		String_Iterator it = {pt->Proc.enable_target_feature, 0};
+		bool first = true;
+		for (;;) {
+			String str = string_split_iterator(&it, ',');
+			if (str == "") break;
+			if (!first) {
+				feature_str = gb_string_appendc(feature_str, ",");
+			}
+			first = false;
+
+			feature_str = gb_string_appendc(feature_str, "+");
+			feature_str = gb_string_append_length(feature_str, str.text, str.len);
 		}
+
+		lb_add_attribute_to_proc_with_string(m, p->value, make_string_c("target-features"), make_string_c(feature_str));
 	}
 
 	if (entity->flags & EntityFlag_Cold) {
@@ -597,16 +604,7 @@ gb_internal void lb_begin_procedure_body(lbProcedure *p) {
 						lbValue ptr = lb_address_from_load_or_generate_local(p, param);
 						GB_ASSERT(LLVMIsAAllocaInst(ptr.value));
 						lb_add_entity(p->module, e, ptr);
-
-						lbBlock *block = p->decl_block;
-						if (original_value != value) {
-							block = p->curr_block;
-						}
-						LLVMValueRef debug_storage_value = value;
-						if (original_value != value && LLVMIsALoadInst(value)) {
-							debug_storage_value = LLVMGetOperand(value, 0);
-						}
-						lb_add_debug_param_variable(p, debug_storage_value, e->type, e->token, param_index+1, block, arg_type->kind);
+						lb_add_debug_param_variable(p, ptr.value, e->type, e->token, param_index+1, p->curr_block);
 					}
 				} else if (arg_type->kind == lbArg_Indirect) {
 					if (e->token.string.len != 0 && !is_blank_ident(e->token.string)) {
@@ -614,7 +612,7 @@ gb_internal void lb_begin_procedure_body(lbProcedure *p) {
 						ptr.value = LLVMGetParam(p->value, param_offset+param_index);
 						ptr.type = alloc_type_pointer(e->type);
 						lb_add_entity(p->module, e, ptr);
-						lb_add_debug_param_variable(p, ptr.value, e->type, e->token, param_index+1, p->decl_block, arg_type->kind);
+						lb_add_debug_param_variable(p, ptr.value, e->type, e->token, param_index+1, p->decl_block);
 					}
 				}
 			}
@@ -2837,8 +2835,7 @@ gb_internal lbValue lb_build_builtin_proc(lbProcedure *p, Ast *expr, TypeAndValu
 				{
 					GB_ASSERT(arg_count <= 7);
 
-					char asm_string_default[] = "int $$0x80";
-					char *asm_string = asm_string_default;
+					char asm_string[] = "int $$0x80";
 					gbString constraints = gb_string_make(heap_allocator(), "={eax}");
 
 					for (unsigned i = 0; i < gb_min(arg_count, 6); i++) {
@@ -2850,15 +2847,10 @@ gb_internal lbValue lb_build_builtin_proc(lbProcedure *p, Ast *expr, TypeAndValu
 							"edx",
 							"esi",
 							"edi",
+							"ebp",
 						};
 						constraints = gb_string_appendc(constraints, regs[i]);
 						constraints = gb_string_appendc(constraints, "}");
-					}
-					if (arg_count == 7) {
-						char asm_string7[] = "push %[arg6]\npush %%ebp\nmov 4(%%esp), %%ebp\nint $0x80\npop %%ebp\nadd $4, %%esp";
-						asm_string = asm_string7;
-
-						constraints = gb_string_appendc(constraints, ",rm");
 					}
 
 					inline_asm = llvm_get_inline_asm(func_type, make_string_c(asm_string), make_string_c(constraints));

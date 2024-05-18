@@ -167,7 +167,7 @@ gb_internal i32 linker_stage(LinkerData *gen) {
 
 					if (has_asm_extension(lib)) {
 						if (!string_set_update(&asm_files, lib)) {
-							String asm_file = asm_files.entries[i].value;
+							String asm_file = lib;
 							String obj_file = concatenate_strings(permanent_allocator(), asm_file, str_lit(".obj"));
 							String obj_format = str_lit("win64");
 						#if defined(GB_ARCH_32_BIT)
@@ -212,10 +212,12 @@ gb_internal i32 linker_stage(LinkerData *gen) {
 				link_settings = gb_string_append_fmt(link_settings, " /PDB:\"%.*s\"", LIT(pdb_path));
 			}
 
-			if (build_context.no_crt) {
-				link_settings = gb_string_append_fmt(link_settings, " /nodefaultlib");
-			} else {
-				link_settings = gb_string_append_fmt(link_settings, " /defaultlib:libcmt");
+			if (build_context.build_mode != BuildMode_StaticLibrary) {
+				if (build_context.no_crt) {
+					link_settings = gb_string_append_fmt(link_settings, " /nodefaultlib");
+				} else {
+					link_settings = gb_string_append_fmt(link_settings, " /defaultlib:libcmt");
+				}
 			}
 
 			if (build_context.ODIN_DEBUG) {
@@ -257,20 +259,31 @@ gb_internal i32 linker_stage(LinkerData *gen) {
 					}
 				}
 
+				String linker_name = str_lit("link.exe");
 				switch (build_context.build_mode) {
 				case BuildMode_Executable:
 					link_settings = gb_string_append_fmt(link_settings, " /NOIMPLIB /NOEXP");
 					break;
 				}
 
+				switch (build_context.build_mode) {
+				case BuildMode_StaticLibrary:
+					linker_name = str_lit("lib.exe");
+					break;
+				default:
+					link_settings = gb_string_append_fmt(link_settings, " /incremental:no /opt:ref");
+					break;
+				}
+
+
 				result = system_exec_command_line_app("msvc-link",
-					"\"%.*slink.exe\" %s %.*s -OUT:\"%.*s\" %s "
-					"/nologo /incremental:no /opt:ref /subsystem:%.*s "
+					"\"%.*s%.*s\" %s %.*s -OUT:\"%.*s\" %s "
+					"/nologo /subsystem:%.*s "
 					"%.*s "
 					"%.*s "
 					"%s "
 					"",
-					LIT(vs_exe_path), object_files, LIT(res_path), LIT(output_filename),
+					LIT(vs_exe_path), LIT(linker_name), object_files, LIT(res_path), LIT(output_filename),
 					link_settings,
 					LIT(build_context.ODIN_WINDOWS_SUBSYSTEM),
 					LIT(build_context.link_flags),
@@ -432,7 +445,7 @@ gb_internal i32 linker_stage(LinkerData *gen) {
 							if (string_ends_with(lib, str_lit(".a")) || string_ends_with(lib, str_lit(".o"))) {
 								// static libs and object files, absolute full path relative to the file in which the lib was imported from
 								lib_str = gb_string_append_fmt(lib_str, " -l:\"%.*s\" ", LIT(lib));
-							} else if (string_ends_with(lib, str_lit(".so"))) {
+							} else if (string_ends_with(lib, str_lit(".so")) || string_contains_string(lib, str_lit(".so."))) {
 								// dynamic lib, relative path to executable
 								// NOTE(vassvik): it is the user's responsibility to make sure the shared library files are visible
 								//                at runtime to the executable
@@ -456,6 +469,10 @@ gb_internal i32 linker_stage(LinkerData *gen) {
 
 			if (build_context.no_crt) {
 				link_settings = gb_string_append_fmt(link_settings, "-nostdlib ");
+			}
+
+			if (build_context.build_mode == BuildMode_StaticLibrary) {
+				compiler_error("TODO(bill): -build-mode:static on non-windows targets");
 			}
 
 			// NOTE(dweiler): We use clang as a frontend for the linker as there are
